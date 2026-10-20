@@ -56,6 +56,25 @@ use crate::storage::Storage;
 use crate::table::partition::PARTITION_METAFIELD_PREFIX;
 use crate::timeline::instant::{Action, Instant};
 
+/// Complete-row public writes accept data columns, never caller-owned lineage.
+pub(crate) fn validate_user_write_batches(batches: &[arrow_array::RecordBatch]) -> Result<()> {
+    let protected = crate::metadata::meta_field::MetaField::field_names_with_operation();
+    for batch in batches {
+        if let Some(field) = batch
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| protected.contains(&field.name().as_str()))
+        {
+            return Err(CoreError::Write(format!(
+                "write input contains protected Hudi metadata field '{}'; remove Hudi metadata columns before reingesting rows",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Write `.hoodie_partition_metadata` if missing (required for Spark FS partition listing).
 pub(crate) async fn ensure_partition_metadata(
     storage: &Storage,
@@ -103,6 +122,78 @@ pub(crate) fn align_batch_to_schema(
         }
     }
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
+}
+
+/// Normalize Arrow aliases before validating or persisting a write schema.
+/// Avro int/string/bytes cannot preserve narrow integers or large offsets.
+pub(crate) fn canonicalize_write_batches(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    use arrow_schema::{DataType, Field, Schema};
+    fn canonical_field(field: &Field) -> Result<Field> {
+        let ty = match field.data_type() {
+            DataType::Int8 | DataType::Int16 => DataType::Int32,
+            DataType::LargeUtf8 => DataType::Utf8,
+            DataType::LargeBinary => DataType::Binary,
+            DataType::List(item) | DataType::LargeList(item) => DataType::List(
+                std::sync::Arc::new(canonical_field(item)?.with_name("element")),
+            ),
+            DataType::Struct(fields) => DataType::Struct(
+                fields
+                    .iter()
+                    .map(|field| canonical_field(field).map(std::sync::Arc::new))
+                    .collect::<Result<Vec<_>>>()?
+                    .into(),
+            ),
+            DataType::Timestamp(unit, Some(_)) => DataType::Timestamp(*unit, Some("UTC".into())),
+            DataType::Decimal256(precision, scale) if *precision <= 38 => {
+                DataType::Decimal128(*precision, *scale)
+            }
+            DataType::Decimal256(precision, _) => {
+                return Err(CoreError::Unsupported(format!(
+                    "write decimal precision {precision} exceeds the supported Avro-to-Arrow precision 38"
+                )));
+            }
+            ty => ty.clone(),
+        };
+        Ok(field.clone().with_data_type(ty))
+    }
+    batches
+        .iter()
+        .map(|batch| {
+            let fields = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| canonical_field(field))
+                .collect::<Result<Vec<_>>>()?;
+            let schema = std::sync::Arc::new(Schema::new_with_metadata(
+                fields,
+                batch.schema().metadata().clone(),
+            ));
+            if schema == batch.schema() {
+                return Ok(batch.clone());
+            }
+            // Cast failures must abort rather than silently replacing values with null.
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| {
+                    arrow::compute::cast_with_options(
+                        column,
+                        field.data_type(),
+                        &arrow::compute::CastOptions {
+                            safe: false,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(CoreError::ArrowError)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            arrow_array::RecordBatch::try_new(schema, columns).map_err(CoreError::ArrowError)
+        })
+        .collect()
 }
 
 pub(crate) fn new_file_id() -> String {
@@ -174,13 +265,14 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
     use futures::StreamExt;
     let count = tasks.len();
     let mut results: Vec<Option<Result<T>>> = std::iter::repeat_with(|| None).take(count).collect();
-    let mut stream = futures::stream::iter(
-        tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, task)| async move { (index, task.await) }),
-    )
-    .buffer_unordered(parallelism.max(1));
+    // Finish mapping before awaiting so the lazy iterator's callable does not
+    // impose higher-ranked lifetime requirements on the enclosing Send future.
+    let indexed_tasks: Vec<_> = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| async move { (index, task.await) })
+        .collect();
+    let mut stream = futures::stream::iter(indexed_tasks).buffer_unordered(parallelism.max(1));
     while let Some((index, result)) = stream.next().await {
         results[index] = Some(result);
     }
@@ -393,6 +485,111 @@ pub(crate) fn build_delete_log_block(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_run_write_tasks_bounds_concurrency_orders_results_and_drains_errors() {
+        use futures::{FutureExt, poll};
+        use tokio::sync::{mpsc, oneshot};
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut tasks = Vec::new();
+        for index in 0..3 {
+            let (release, wait) = oneshot::channel();
+            releases.push(release);
+            let started = started_tx.clone();
+            let finished = finished_tx.clone();
+            tasks.push(
+                async move {
+                    started.send(index).unwrap();
+                    wait.await.unwrap();
+                    finished.send(index).unwrap();
+                    if index == 1 {
+                        Err(CoreError::Write("injected task failure".into()))
+                    } else {
+                        Ok(index)
+                    }
+                }
+                .boxed(),
+            );
+        }
+        let mut runner = Box::pin(run_write_tasks(tasks, 2));
+        assert!(poll!(runner.as_mut()).is_pending());
+        assert_eq!(started_rx.try_recv().unwrap(), 0);
+        assert_eq!(started_rx.try_recv().unwrap(), 1);
+        assert!(started_rx.try_recv().is_err());
+
+        let release_last = releases.pop().unwrap();
+        releases.pop().unwrap().send(()).unwrap();
+        assert!(poll!(runner.as_mut()).is_pending());
+        assert_eq!(finished_rx.try_recv().unwrap(), 1);
+        assert_eq!(started_rx.try_recv().unwrap(), 2);
+        release_last.send(()).unwrap();
+        assert!(poll!(runner.as_mut()).is_pending());
+        assert_eq!(finished_rx.try_recv().unwrap(), 2);
+        releases.pop().unwrap().send(()).unwrap();
+
+        let mut results = runner.await.into_iter();
+        assert_eq!(finished_rx.try_recv().unwrap(), 0);
+        assert_eq!(results.next().unwrap().unwrap(), 0);
+        assert!(
+            matches!(results.next().unwrap(), Err(CoreError::Write(message))
+            if message == "injected task failure")
+        );
+        assert_eq!(results.next().unwrap().unwrap(), 2);
+        assert!(results.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_write_tasks_zero_parallelism_runs_sequentially() {
+        use futures::{FutureExt, poll};
+        use tokio::sync::{mpsc, oneshot};
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut tasks = Vec::new();
+        for index in 0..2 {
+            let (release, wait) = oneshot::channel();
+            releases.push(release);
+            let started = started_tx.clone();
+            tasks.push(
+                async move {
+                    started.send(index).unwrap();
+                    wait.await.unwrap();
+                    Ok(index)
+                }
+                .boxed(),
+            );
+        }
+        let mut runner = Box::pin(run_write_tasks(tasks, 0));
+        for (index, release) in releases.into_iter().enumerate() {
+            assert!(poll!(runner.as_mut()).is_pending());
+            assert_eq!(started_rx.try_recv().unwrap(), index);
+            assert!(started_rx.try_recv().is_err());
+            release.send(()).unwrap();
+        }
+        assert_eq!(
+            runner
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn test_user_write_validation_only_rejects_exact_top_level_meta_fields() {
+        use arrow_schema::{DataType, Field, Schema};
+        let nested = Field::new("_hoodie_commit_time", DataType::Utf8, true);
+        let schema = Schema::new(vec![
+            Field::new("_hoodie_custom", DataType::Utf8, true),
+            Field::new("payload", DataType::Struct(vec![nested].into()), true),
+        ]);
+        let batch = arrow_array::RecordBatch::new_empty(std::sync::Arc::new(schema));
+        validate_user_write_batches(&[batch]).unwrap();
+    }
+
     /// Two writers fencing the same instant: the second must get a conflict,
     /// not silently share the instant.
     #[tokio::test]
@@ -477,3 +674,6 @@ mod tests {
         assert!(std::str::from_utf8(&json).unwrap().contains("UPSERT"));
     }
 }
+
+#[cfg(test)]
+mod completion_tests;

@@ -81,6 +81,9 @@ async fn append_batches_inner(
     batches: &[RecordBatch],
     require_append_only: bool,
 ) -> Result<AppendResult> {
+    crate::write::validate_user_write_batches(batches)?;
+    let canonical = crate::write::canonicalize_write_batches(batches)?;
+    let batches = canonical.as_slice();
     table.reload_timeline_for_write().await?;
     if !table.is_mor() {
         if require_append_only {
@@ -438,15 +441,11 @@ async fn append_batches_inner(
     };
     let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
     let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
-    if let Err(error) = storage
+    // A failed response may follow a durable completion. Retain data and the
+    // recovery trail; eager rollback checks the timeline before deleting files.
+    storage
         .put_file_if_absent(&commit_relative_path, commit_bytes)
-        .await
-    {
-        for path in &written_paths {
-            let _ = storage.delete_file(path).await;
-        }
-        return Err(error.into());
-    }
+        .await?;
     // The commit is durable from here: post-commit maintenance (markers,
     // archival) and handle refresh are best-effort — a transient failure must
     // not turn a committed write into an Err the caller would retry.
@@ -841,10 +840,13 @@ async fn ensure_append_schema_matches_table(
 }
 
 pub(crate) fn strip_meta_fields_from_schema(schema: &arrow_schema::Schema) -> arrow_schema::Schema {
+    // Only writer-owned metadata is removed. Ordinary prefixed columns and
+    // the built-in delete marker must remain in the committed data schema.
+    let meta = crate::metadata::meta_field::MetaField::field_names_with_operation();
     let fields: Vec<_> = schema
         .fields()
         .iter()
-        .filter(|f| !f.name().starts_with("_hoodie_"))
+        .filter(|f| !meta.contains(&f.name().as_str()))
         .cloned()
         .collect();
     arrow_schema::Schema::new(fields)
@@ -1134,11 +1136,16 @@ mod tests {
 
     #[test]
     fn test_strip_meta_fields_from_schema() {
-        let schema = Schema::new(vec![
-            Field::new("_hoodie_commit_time", DataType::Utf8, true),
-            Field::new("_hoodie_record_key", DataType::Utf8, true),
+        let mut fields = crate::metadata::meta_field::MetaField::field_names_with_operation()
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect::<Vec<_>>();
+        fields.extend([
             Field::new("id", DataType::Utf8, false),
+            Field::new("_hoodie_custom", DataType::Utf8, true),
+            Field::new("_hoodie_is_deleted", DataType::Boolean, true),
         ]);
+        let schema = Schema::new(fields);
         let stripped = strip_meta_fields_from_schema(&schema);
         assert_eq!(
             stripped
@@ -1146,8 +1153,9 @@ mod tests {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id"]
+            vec!["id", "_hoodie_custom", "_hoodie_is_deleted"]
         );
+        assert_eq!(&stripped.fields()[..], &schema.fields()[6..]);
     }
 
     fn id_batch(n: usize) -> arrow_array::RecordBatch {
